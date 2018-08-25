@@ -1,0 +1,72 @@
+Title         : Caffe2核心代码解析系列：综述
+Author        : manofmountain
+Logo          : True
+
+[TITLE]
+
+# 介绍
+
+笔者当下恰有工作需要对caffe2底层实现有较好的认识。打算趁这个工作机会学习下caffe2框架底层的具体设计及实现，同时写一个系列的相关学习笔记文章集出来，希望能对想深入了解深度学习框架实现的朋友有些启发。
+
+当下最为火热、流行的深度学习框架非Google领导的Tensorflow莫属。其次则为分别由Facebook及Amazon力推的Pytorch（caffe2为其一个后端）与Mxnet。这些框架本身很多设计思路及具体实现都是类似的，因此学其一可知其它。在这当中显然caffe2的整个代码结构要相当简单些，所以比较适合入门学习。
+
+Caffe是另一个较为经典的深度学习框架。由于其良好的性能，至今仍有国内的很多公司选择caffe（或自己深度定制过的caffe）为自己的深度学习软件框架。而caffe2与caffe的设计者是同一个人（现在Facebook的Jiang, Yangqing），很多caffe2中的理念及术语更是直接源自于caffe，因此对于有过caffe相当知识的朋友，caffe2学习起来相对也较为简单。
+
+![Caffe2_Logo]
+
+[Caffe2_Logo]: images/Caffe2_Logo.JPG "Caffe2_Logo" { width:auto; max-width:90% }
+
+
+# caffe2核心代码组成
+
+Caffe2框架是一个静态的图框架。同大多静态图框架一样，它的应用程序一般会干两件事情，先是建立模型（即建图，主要使用python等较友好的语言脚本或像caffe那样直接使用prototxt文件），然后则是迭代执行模型。业务层面而言，它需要能够方便解决两个深度学习的任务及训练与推理。
+
+## Net
+
+为了建立图，显然需要有图的概念，caffe2中的图即是Net。Net表示的是一系列计算执行操作的集合。
+
+## Operator
+
+Net之中那些具体的执行操作被称为是operator（简称Op）。
+
+## Blob
+
+operator之间通过相互依赖的输入、输出发生关联关系。而这些operator的输入、输出则被称为Blob。Blob是深度学习模型当中数据元素的抽象，它可以指的是具体的输入、输出数据，也可以指的是operator计算当中用当到的可训练参数等。
+
+## Tensor
+
+显然反映high level数据抽象的Blob都应有相应的底层内存单元在背后。而Tensor则ghd 是这些底层内存单元的进一步封装。每个tensor都可以直接访问对应的内存单元地址，它之上的数据元素类型，它的大小，内存初始化及析构函数等则被封装到另外一个单元当中。这个单元即为TypeMeta，它具体反映tensor里面的数据元素的类型及相应的底层实现所需细节。
+
+## Context
+
+Tensor与Operator分别对应相应的内存单元抽象及计算单元抽象。众所周知，当下可用于深度学习任务的计算单元有许多像CPU/GPU/FPGA/ASIC芯片等。它们在执行具体的计算任务时，分别有着不同的实现（分别包装着其各自特定的计算指令集及内存分配与读写单元）。caffe2中将各类不同的device封装为一个个不同的context对象。然后Tensor/Operator则以模板的形式分别在实例化时支持不同的底层计算设备context。
+
+## Registry
+
+像Windows中使用注册表来管理其系统上的配置等信息一样，caffe2中也使用了全局Registry的方式对各种不同类型Op/OpSchema/Net等具体实现都进行了注册。这样当具体某个operator运行时，都会去全局Registry table里面查找此operator在相应设备上对应的注册实现并调用执行。一旦它发现此种类型实现不存在，那么就会报错退出。Net的不同类型执行也与此机理大致相似。
+
+## Workspace
+
+当我们具体执行某个深度学习模型训练或推理任务时，需要考虑对全局所用到的变量及计算单元命名空间进行管理。它应当作为深度学习任务的发起者及终结者（当然还是收拾者）。这么一个角色在Tensorflow里面是Session，而caffe2中则是Workspace。它包含了一切运行时创建的对象，包括所有的Blob，以及Net等。
+
+## Python绑定
+
+Caffe2中上当只支持C++与Python两种语言。在它的哲学当中，一切计算复杂的单元都应由C++实现的函数中来完成，而Python只是因其用户友好性被用来进行建图，规划整个图执行，并不真正参与核心的计算。这一点保证了它的高效率，但同时也意味着它对其它语言的支持不够好，同时也无法很灵活地添加一些由Python等高级语言写就的Operators。
+
+一般由Python脚本所描绘的图会会序列化为protobuf文件，然后传入C++端，开始执行网络的计算过程。
+
+在使用Python构建一个完整的用来作training工作的图时，只需要显示写出做前向计算的系列operators，然后通过使用AddGradientOperators方法（以最终的loss作为其输入参数）可自动完成反向梯度计算的operators的添加。
+
+总之Caffe2中的一切真正计算像先向/反向计算/Checkpoints保存/参数更新乃至参数初始化等等无一例外均是通过某一实现好的C++ operator函数来执行。
+
+# 参考文献
+
+* https://caffe2.ai/
+
+
+
+
+
+
+
+
