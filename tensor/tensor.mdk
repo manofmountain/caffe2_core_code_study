@@ -1,0 +1,15 @@
+Title         : Caffe2核心代码解析系列之三：Tensor
+Author        : manofmountain
+Logo          : True
+
+[TITLE]
+
+# 介绍
+
+Caffe2 core code中与tensor相关的可见于以下几个文件。
+```
+$ ls tensor
+tensor.cc       tensor.h        tensor_int8.cc  tensor_int8.h
+```
+
+Tensor是Caffe2中的连续内存区域抽象。它最主要的成员有三个分别为指向实际分配的内存的裸地址data_，反映此内存区域类型信息的meta_，然后则是反映它维度构成的dims_相量。
