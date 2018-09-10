@@ -12,4 +12,134 @@ $ ls tensor
 tensor.cc       tensor.h        tensor_int8.cc  tensor_int8.h
 ```
 
-Tensor是Caffe2中的连续内存区域抽象。它最主要的成员有三个分别为指向实际分配的内存的裸地址data_，反映此内存区域类型信息的meta_，然后则是反映它维度构成的dims_相量。
+Tensor是Caffe2中的连续内存区域抽象。而Tensor主要作为一个内存抽象APIs集合供外部如Operator来使用，其内部的大多数功能都依靠TensorImpl这个类来完成。TensorImpl的主要成员有两个，一个为dims_，它包含了当下内存的维度层次表示，另外一个则为storage_，它是一个Storage对象，亦是一个wrapper（实际起作用的为StorageImple，里面包含了此内存的实际地址，包含元素的类型(TypeMeta)等），同Tensor与TensorImpl的结构类似。
+
+新一版Caffe2里面使用了许多Aten（有名的Tensor操作库，之前主要由Pytorch来使用）里的元素。像TensorImpl与Storage都是c10::intrusive_ptr_target的子类，内部自带了引用计数的操作。自然Tensor里在调用它们时都是通过使用类型为c10::intrusive_ptr的成员。
+
+下面我们将分别介绍下StorageImpl，Storage，TensorImpl及Tensor的内容。至于c10::intrusive_ptr_target与c10::intrusive_ptr多属于Aten的内容，在这里暂不作过多说明。
+
+# StorageImpl
+
+新的Tensor实现里不再以Template的形式来支持不同类型的Context。现在是通过将Tensor实现所需的DeviceType在构造时传入，并再转而构造一个Device specific的Storage对象来实现不同Device context支持。Storage里面的大多数功能都通过StorageImpl来实现。
+
+下面的StorageImpl构造函数可以看出这一作法。
+
+```
+explicit StorageImpl(DeviceType device_type) : device_type_(device_type) {}
+  StorageImpl(DeviceType device_type, TypeMeta data_type)
+      : data_type_(data_type), device_type_(device_type) {}
+```
+
+当然更常用的是我们同时指出管理内存的实际地址、包含空间大小、上面元素的类型及对其进行删除的方法。如下所示：
+
+```
+template <typename Deleter = MemoryDeleter>
+  StorageImpl(
+      DeviceType device_type,
+      TypeMeta data_type,
+      void* src,
+      size_t capacity,
+      Deleter d = nullptr)
+      : data_type_(data_type), device_type_(device_type) {
+    CAFFE_ENFORCE_WITH_CALLER(
+        data_type_.id() != TypeIdentifier::uninitialized(),
+        "To create storage with a raw external pointer you need to pass in an "
+        "initialized data_type(TypeMeta).");
+    // Check if the deleter is a MemoryDeleter and is a simple nullptr.
+    if (std::is_same<MemoryDeleter, Deleter>::value &&
+        reinterpret_cast<MemoryDeleter*>(static_cast<void*>(&d))[0] ==
+            nullptr) {
+      // Use aliasing constructor trick to avoid calling the destructor.
+      data_ptr_ = std::shared_ptr<void>(std::shared_ptr<void>(), src);
+    } else {
+      data_ptr_.reset(src, d);
+    }
+    capacity_ = capacity;
+  }
+```
+
+明白了StorageImpl里面所含有的基本成员，我们就清楚了它所能提供的对这些成员进行操作的一些方法，举例如下：
+
+```
+...........
+...........
+ void reset() {
+    data_ptr_.reset();
+    capacity_ = 0;
+  }
+
+  template <typename T>
+  inline bool IsType() const {
+    return data_type_.Match<T>();
+  }
+
+  void* data() const {
+    return data_ptr_.get();
+  }
+
+  void* data() {
+    return data_ptr_.get();
+  }
+
+  DataPtr& data_ptr() {
+    return data_ptr_;
+  }
+...........
+...........
+```
+
+# Storage
+
+Storage对象里面包含一个类型为c10::instrusitive_ptr的StorageImpl成员。然后它以外包的形式，向外开放StorageImpl所提供的一些功能支持。
+
+如下为Storage的一个较全的构造函数。
+
+```
+  template <typename Deleter = MemoryDeleter>
+  Storage(
+      void* src,
+      DeviceType device_type,
+      TypeMeta data_type,
+      size_t capacity,
+      Deleter d = nullptr)
+      : storage_impl_(c10::make_intrusive<StorageImpl>(
+            device_type,
+            data_type,
+            src,
+            capacity,
+            d)) {}
+```
+
+然后通过外包，向外提供一些基本的内存单元属性读取或设置功能。
+
+```
+...............
+...............
+  void reset() {
+    storage_impl_->reset();
+  }
+
+  template <typename T>
+  inline bool IsType() const {
+    return storage_impl_->IsType<T>();
+  }
+
+  void* data() const {
+    return storage_impl_->data();
+  }
+
+  void* data() {
+    return storage_impl_->data();
+  }
+
+  DataPtr& data_ptr() {
+    return storage_impl_->data_ptr();
+  }
+
+  const DataPtr& data_ptr() const {
+    return storage_impl_->data_ptr();
+  }
+```
+
+# TensorImpl
+
