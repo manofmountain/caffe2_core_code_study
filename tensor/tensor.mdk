@@ -12,15 +12,15 @@ $ ls tensor
 tensor.cc       tensor.h        tensor_int8.cc  tensor_int8.h
 ```
 
-Tensor是Caffe2中的连续内存区域抽象。而Tensor主要作为一个内存抽象APIs集合供外部如Operator来使用，其内部的大多数功能都依靠TensorImpl这个类来完成。TensorImpl的主要成员有两个，一个为dims_，它包含了当下内存的维度层次表示，另外一个则为storage_，它是一个Storage对象，亦是一个wrapper（实际起作用的为StorageImple，里面包含了此内存的实际地址，包含元素的类型(TypeMeta)等），同Tensor与TensorImpl的结构类似。
+Tensor是Caffe2中的连续内存区域抽象表示。真正的caffe2 code中Tensor主要作为一个内存抽象APIs集合来供外部如Operator等对象来使用，其内部的大多数功能都实际依靠TensorImpl这个类来完成。TensorImpl的主要成员有两个，一个为dims_，它包含了当下内存的维度层次表示，另外一个则为storage_，它是一个Storage对象，亦是一个wrapper，实际起作用的为StorageImple，里面包含了此内存的实际地址，包含元素的类型(TypeMeta)等，同Tensor与TensorImpl的结构类似。
 
-新一版Caffe2里面使用了许多Aten（有名的Tensor操作库，之前主要由Pytorch来使用）里的元素。像TensorImpl与Storage都是c10::intrusive_ptr_target的子类，内部自带了引用计数的操作。自然Tensor里在调用它们时都是通过使用类型为c10::intrusive_ptr的成员。
+新一版Caffe2里面使用了许多Aten（有名的Tensor操作库，之前主要由Pytorch来使用）里的元素。像TensorImpl与Storage都是c10::intrusive_ptr_target的子类，内部自带了引用计数的操作。自然Tensor里在调用它们时都是通过使用类型为c10::intrusive_ptr的成员来做的。
 
 下面我们将分别介绍下StorageImpl，Storage，TensorImpl及Tensor的内容。至于c10::intrusive_ptr_target与c10::intrusive_ptr多属于Aten的内容，在这里暂不作过多说明。
 
 # StorageImpl
 
-新的Tensor实现里不再以Template的形式来支持不同类型的Context。现在是通过将Tensor实现所需的DeviceType在构造时传入，并再转而构造一个Device specific的Storage对象来实现不同Device context支持。Storage里面的大多数功能都通过StorageImpl来实现。
+新的Tensor实现里不再以Template的形式来支持不同类型的Context，而是通过将Tensor实现所需的DeviceType在构造时传入，并再转而构造一个Device specific的Storage对象来实现不同Device context支持。Storage里面的大多数功能都通过StorageImpl来实现。
 
 下面的StorageImpl构造函数可以看出这一作法。
 
@@ -139,7 +139,504 @@ Storage对象里面包含一个类型为c10::instrusitive_ptr的StorageImpl成�
   const DataPtr& data_ptr() const {
     return storage_impl_->data_ptr();
   }
+...............
+...............
+  inline long use_count() const {
+    return storage_impl_.use_count();
+  }
+
+  inline bool unique() const {
+    return storage_impl_.unique();
+  }
+
+  template <typename Deleter = MemoryDeleter>
+  void UniqueStorageShareExternalPointer(
+      void* src,
+      const DataType& data_type,
+      size_t capacity,
+      Deleter d = nullptr) {
+    CAFFE_ENFORCE_WITH_CALLER(
+        storage_impl_.unique(),
+        "UniqueStorageShareExternalPointer can only be called when \
+        use_count == 1");
+    storage_impl_->UniqueStorageShareExternalPointer<Deleter>(
+        src, data_type, capacity, d);
+  }
+
+ protected:
+  c10::intrusive_ptr<StorageImpl> storage_impl_;
+};
 ```
 
 # TensorImpl
 
+TensorImpl对内存的管理通过两个成员完成，一个为dims，另一个则为storage_。其中storage_为上面讲过的一个Storage对象，里面有所管理内存的实际地址，空间大小，类型(TypeMeta)等。
+
+```
+class CAFFE2_API TensorImpl : public c10::intrusive_ptr_target {
+ public:
+  TensorImpl() = delete;
+  explicit TensorImpl(DeviceType device_type) : storage_(device_type) {}
+
+  /**
+   * @brief Creates a tensor of the given dimension.
+   *
+   * Note that the actual data allocation is not going to be carried out until
+   * the first time mutable_data() is called.
+   */
+  // TODO: here, we create a Storage
+  // and immediately discard it in Resize() since
+  // reset_tensor will be true and FreeMemory will be called,
+  // we might want to avoid creating Storage twice?
+  explicit TensorImpl(const vector<TIndex>& dims, at::DeviceType device_type)
+      : storage_(device_type) {
+    Resize(dims);
+  }
+```
+
+我们可以move copy或assign tensorImpl对象，但却不可以以复制copy的形式进行操作。
+```
+  /**
+   * @brief Delete the copy constructor and use Clone explicitly
+   */
+  TensorImpl(const TensorImpl& src) = delete;
+
+  TensorImpl(TensorImpl&& src) noexcept {
+    swap(src);
+  }
+
+  TensorImpl& operator=(TensorImpl&&) = default;
+  // Note(jiayq): possibly a rule-of-three violation, but we explicitly
+  // discourage the use of = for Tensors.
+  TensorImpl& operator=(const TensorImpl& src) = delete;
+```
+
+因为Tensor去掉了Context的模板参数，因此将它作为一个static的成员放在了类里面，指向DeviceType所对应的Context（DeviceType则存在Storage对象成员里面如上节所讲。）
+
+```
+  /*
+   * Since we removed template from tensor, we now store a static
+   * context pointer in tensor, which indicates the type of the tensor.
+   */
+  BaseStaticContext* GetStaticContext() const {
+    return get_static_context(GetDeviceType());
+  }
+
+  /* @brief
+   * Create a context that has the same device_type
+   * as the tensor.
+   * Note that this doesn't support passing in argument
+   * TODO(jerryzh): move this to a global registry
+   * that can create context for us
+   */
+  std::unique_ptr<BaseContext> CreateContext() const {
+    return GetStaticContext()->CreateContext();
+  }
+```
+
+如下为一个Tensor扩展其内存空间的方法。
+
+```
+  /**
+   * @brief Extends the outer-most dimension of this tensor by num elements,
+   * preserving the existing data.
+   *
+   * The underlying data may be reallocated in order to accommodate the new
+   * elements, in which case this tensors' capacity is grown at a factor of
+   * growthPct. This ensures that Extend runs on an amortized O(1) time
+   * complexity.
+   */
+  void Extend(TIndex num, float growthPct, BaseContext* context) {
+    CAFFE_ENFORCE_WITH_CALLER(
+        is_contiguous_, "Tensor must be contiguous in order to call Extend.");
+    CAFFE_ENFORCE_GE_WITH_CALLER(dims_.size(), 1);
+    CAFFE_ENFORCE_GE_WITH_CALLER(
+        num, 0, "`num` must be non-negative for Extend");
+    auto newDims = dims_;
+    newDims[0] += num;
+    if (!storage_.data()) {
+      Resize(newDims);
+      return;
+    }
+    auto newNumel = std::accumulate(
+        newDims.begin(),
+        newDims.end(),
+        static_cast<TIndex>(1),
+        std::multiplies<TIndex>());
+    if (newNumel * storage_.itemsize() <= storage_.capacity()) {
+      dims_ = newDims;
+      numel_ = newNumel;
+      return;
+    }
+    auto newCapacity = dims_;
+    newCapacity[0] = std::max<size_t>(
+        newDims[0], std::ceil(dims_[0] * (growthPct + 100) / 100));
+    auto oldData = std::move(storage_.data_ptr());
+    auto oldSize = numel_;
+    auto oldDims = dims_;
+    Resize(newCapacity);
+    auto* newData = raw_mutable_data(storage_.dtype());
+    CAFFE_ENFORCE(
+        context != nullptr, "Context must be provided to Extend the tensor");
+    context->CopyItemsSameDevice(
+        storage_.dtype(), oldSize, oldData.get(), newData);
+    reserved_ = true;
+    dims_ = newDims;
+    numel_ = newNumel;
+  }
+```
+以下为对Tensor管理空间进行shrink时所做的事。注意我们不可对共享的storage单元进行shrink操作。
+
+```
+  /**
+   * @brief Shrinks the outer-most dimension to given size, keeping the data.
+   *
+   * This method guarantees that no re-allocations are carried out, which means
+   * that the extra capacity after the end of the shurnk tensor is maintained.
+   */
+  void ShrinkTo(TIndex outer_dim) {
+    CAFFE_ENFORCE_WITH_CALLER(
+        is_contiguous_, "Tensor must be contiguous in order to call ShrinkTo.");
+    CAFFE_ENFORCE_WITH_CALLER(dims_.size() >= 1, "Tensor must be at least 1D");
+    CAFFE_ENFORCE_WITH_CALLER(
+        outer_dim <= dims_[0],
+        "New outer dimension must be smaller than current.");
+    CAFFE_ENFORCE(
+        storage_.unique(),
+        "Can't call ShrinkTo on shared storage, please call Resize instead.");
+    dims_[0] = outer_dim;
+    numel_ = std::accumulate(
+        dims_.begin(),
+        dims_.end(),
+        static_cast<TIndex>(1),
+        std::multiplies<TIndex>());
+  }
+```
+
+Tensor上的Resize操作，则主要是更改dims；只有某些情况下，一些flags存在，加上实时条件满足则会真正地释放掉旧的内存，下一次mutable_data调用时则重新分配内存。
+
+```
+  /**
+   * @brief Resizes a tensor.
+   *
+   * Resize takes in a vector of ints specifying the dimensions of the tensor.
+   * You can pass in an empty vector to specify that it is a scalar (i.e.
+   * containing one single item).
+   *
+   * The underlying storage may be deleted after calling Resize: if the new
+   * shape leads to a different number of items in the tensor, the old memory
+   * is deleted and new memory will be allocated next time you call
+   * mutable_data(). However, if the shape is different but the total number of
+   * items is the same, the underlying storage is kept.
+   */
+  template <typename... Ts>
+  void Resize(Ts... dim_source) {
+    bool is_init = numel_ == -1;
+    bool size_changed = SetDims(dim_source...);
+    if (size_changed) {
+      // If needed, we will free the data. the next mutable_data() call
+      // will create the data storage.
+      bool reset_tensor = false;
+      if (reserved_) {
+        // If tensor is reserved then don't claim its memeory unless capacity()
+        // is smaller than new size
+        reset_tensor = storage_.capacity() < numel_ * storage_.itemsize();
+      } else {
+        reset_tensor = storage_.capacity() < numel_ * storage_.itemsize() ||
+            !FLAGS_caffe2_keep_on_shrink ||
+            storage_.capacity() - numel_ * storage_.itemsize() >
+                FLAGS_caffe2_max_keep_on_shrink_memory;
+      }
+
+      if (reset_tensor && !is_init) {
+        FreeMemory();
+      }
+    }
+  }
+```
+
+Reshape则只是需要保证新的dims与旧的dims总的size相同，然后直接改变dims，而对底下的storage对象则并不改动。
+
+```
+  /**
+   * Resizes the tensor without touching underlying storage.
+   * This requires the total size of the tensor to remains constant.
+   */
+  inline void Reshape(const vector<TIndex>& dims) {
+    CAFFE_ENFORCE_WITH_CALLER(
+        is_contiguous_, "Tensor must be contiguous in order to call Reshape.");
+    TIndex new_size = 1;
+    for (auto d : dims) {
+      CAFFE_ENFORCE_GE_WITH_CALLER(d, 0);
+      new_size *= d;
+    }
+    CAFFE_ENFORCE_WITH_CALLER(
+        new_size == numel_,
+        "New size and old size are not equal. You cannot use Reshape, "
+        "but should use Resize."
+        // TODO(jiayq): remove the following warning after pending diffs
+        // stabilize.
+        " The old caffe2 mixes Reshape and Resize but this behavior has "
+        "been changed. If you find this error, most likely you will need "
+        "to change corresponding code from Reshape to Resize.");
+    dims_ = dims;
+  }
+```
+
+ShareData则是为了在多个Tensor之间共享底部的Storage，而它们可以有着完全不同的dims，只需要保证其size相同即可。
+
+```
+  /**
+   * @brief Shares the data with another tensor.
+   *
+   * To share data between two tensors, the sizes of the two tensors must be
+   * equal already. The reason we do not implicitly do a Resize to make the two
+   * tensors have the same shape is that we want to allow tensors of different
+   * shapes but the same number of items to still be able to share data. This
+   * allows one to e.g. have a n-dimensional Tensor and a flattened version
+   * sharing the same underlying storage.
+   *
+   * The source tensor should already have its data allocated.
+   */
+  void ShareData(const TensorImpl& src) {
+    // Right now, we are assuming the device_type are the same, since it is
+    // inherently the same in the non-templatized code. We should probably add
+    // an ENFORCE here which might affect perf a little bit.
+    CAFFE_ENFORCE_EQ_WITH_CALLER(
+        src.numel_,
+        numel_,
+        "Size mismatch - did you call reshape before sharing the data?");
+    // It is possible that the source tensor hasn't called mutable_data() yet,
+    // in which case ShareData() doesn't make much sense since we don't really
+    // know what to share yet.
+    CAFFE_ENFORCE_WITH_CALLER(
+        src.storage_.data() || src.numel_ == 0,
+        "Source tensor has no content and has size > 0");
+    // Finally, do sharing.
+    /* Since we create new Storage whenever we need to change data_type/capacity
+     * this still keeps the original semantics
+     */
+    storage_ = src.storage();
+  }
+```
+
+以下为返回只读的raw data或者带类型（Typename T）的data的方法。
+
+```
+  /**
+   * Returns a const raw void* pointer of the underlying storage. mutable_data()
+   * or raw_mutable_data() must have been called prior to this function call.
+   */
+  inline const void* raw_data() const {
+    CAFFE_ENFORCE_WITH_CALLER(
+        is_contiguous_,
+        "Tensor must be contiguous in order to call raw_data()");
+    CAFFE_ENFORCE_WITH_CALLER(storage_.data() || numel_ == 0);
+    return storage_.data();
+  }
+
+  /**
+   * Returns a typed pointer of the underlying storage. mutable_data() or
+   * raw_mutable_data() must have been called prior to this function call, and
+   * the data type must be of the correct type. If you want to get a void*
+   * pointer instead, use raw_data().
+   */
+  template <typename T>
+  inline const T* data() const {
+    CAFFE_ENFORCE_WITH_CALLER(
+        is_contiguous_, "Tensor must be contiguous in order to call data()");
+    CAFFE_ENFORCE_WITH_CALLER(
+        storage_.data() || numel_ == 0,
+        "The tensor is of non-zero shape, but its data is not allocated yet. "
+        "Caffe2 uses a lazy allocation, so you will need to call "
+        "mutable_data() or raw_mutable_data() to actually allocate memory.");
+    CAFFE_ENFORCE_WITH_CALLER(
+        IsType<T>(),
+        "Tensor type mismatch, caller expects elements to be ",
+        TypeMeta::TypeName<T>(),
+        " while tensor contains ",
+        storage_.dtype().name());
+    return static_cast<T*>(storage_.data());
+  }
+```
+
+以下为有意思的mutable_data的实现方法。其实里面有一个delay执行分配内存的优化做法。
+
+```
+  /**
+   * Returns a mutable raw pointer of the underlying storage. Since we will need
+   * to know the type of the data for allocation, a TypeMeta object is passed in
+   * to specify the necessary information. This is conceptually equivalent of
+   * calling mutable_data<T>() where the TypeMeta parameter meta is derived from
+   * the type T. This function differs from mutable_data<T>() in the sense that
+   * the type T can be specified during runtime via the TypeMeta object.
+   *
+   * If the existing data does not match the desired type, it will be deleted
+   * and a new storage will be created.
+   */
+  inline void* raw_mutable_data(const TypeMeta& meta) {
+    CAFFE_ENFORCE_WITH_CALLER(
+        is_contiguous_,
+        "Tensor must be contiguous in order to call raw_mutable_data()");
+    // For 0-size tensors it's fine to return any pointer (including nullptr)
+    if (storage_.dtype() == meta && (storage_.data() || numel_ == 0)) {
+      return storage_.data();
+    } else {
+      bool had_special_dtor = storage_.dtype().dtor() != nullptr;
+      if (storage_.unique()) {
+        storage_.set_dtype(meta);
+        // TODO: recalcuate numel when we store numel instead of capacity in
+        // Storage
+      } else {
+        if (storage_.dtype() != meta) {
+          storage_ = Storage(storage_.device_type(), meta);
+        }
+      }
+      CAFFE_ENFORCE_WITH_CALLER(
+          numel_ >= 0,
+          "Tensor is not initialized. You probably need to call Resize() "
+          "before calling mutable_data()");
+
+      // We can reuse the existing buffer if the current data does not have
+      // a special destructor and the new data doesn't have a special
+      // constructor.
+      if (numel_ == 0 ||
+          (meta.ctor() == nullptr && !had_special_dtor &&
+           storage_.capacity() >= numel_ * storage_.itemsize())) {
+        return storage_.data();
+      }
+      if (meta.ctor()) {
+        // For types that need placement new, we will call it, as well as
+        // making sure that when the data is freed, it calls the right
+        // destruction procedure.
+        auto size = numel_;
+        auto dtor = storage_.dtype().dtor();
+        auto ptr_and_deleter =
+            GetStaticContext()->New(numel_ * storage_.itemsize());
+        auto deleter = ptr_and_deleter.second;
+        storage_.data_ptr().reset(
+            ptr_and_deleter.first, [size, dtor, deleter](void* ptr) -> void {
+              dtor(ptr, size);
+              deleter(ptr);
+            });
+        storage_.dtype().ctor()(storage_.data(), numel_);
+      } else {
+        // For fundamental type, new and delete is easier.
+        auto ptr_and_deleter =
+            GetStaticContext()->New(numel_ * storage_.itemsize());
+        storage_.data_ptr().reset(
+            ptr_and_deleter.first, ptr_and_deleter.second);
+      }
+      storage_.set_numel(numel_);
+      return storage_.data();
+    }
+  }
+```
+
+下面为它的一些protected成员。
+
+```
+ protected:
+  DimVector dims_; // sizes_
+  DimVector strides_;
+  TIndex numel_ = -1; // numel_
+  bool is_contiguous_ = true;
+  // we decide to keep reserved_ and it will
+  // live in Tensor after the split
+  // The logic is that if Extend() or ReserveSpace() were ever called,
+  // then subsequent Resize()s will not free up Storage.
+  bool reserved_ = false;
+  Storage storage_;
+  // int64_t storage_offset_;
+```
+
+我们还有一个static的UndefinedTensor使用。
+
+```
+class CAFFE2_API UndefinedTensorImpl final : public TensorImpl {
+  UndefinedTensorImpl() : TensorImpl(CPU){};
+
+ public:
+ // Without this, we get:
+ //  error: identifier "at::UndefinedTensor::_singleton" is undefined in device code
+ // (ostensibly because the constexpr tricks MSVC into trying to compile this
+ // function for device as well).
+#ifdef _WIN32
+ static inline TensorImpl * singleton() {
+#else
+ static constexpr inline TensorImpl * singleton() {
+#endif
+    return &singleton_;
+  }
+
+ private:
+  static UndefinedTensorImpl singleton_;
+};
+```
+
+# Tensor
+
+最后我们来看下真正外部程序所见的对象，Tensor。
+
+以下为它的构造函数及基本类成员，从此易知它的大部分操作都是借助TensorImpl来完成的。在它的多个构造函数当中还有一个模板构造函数。
+
+```
+/**
+ * @brief Tensor class holds a shared pointer to the implementation TensorImpl,
+ * redirects API calls to TensorImpl;
+ * Copying of Tensor results in sharing the same underlying implementation
+ * object
+ */
+class CAFFE2_API Tensor final {
+ protected:
+  using TensorImplPtr = c10::intrusive_ptr<TensorImpl, UndefinedTensorImpl>;
+  TensorImplPtr impl_;
+
+ public:
+  Tensor() : impl_() {}
+
+  operator bool() const {
+    return impl_.defined();
+  }
+
+  explicit Tensor(const vector<TIndex>& dims, DeviceType type)
+      : impl_(
+            c10::make_intrusive<TensorImpl, UndefinedTensorImpl>(dims, type)) {}
+
+  template <
+      typename T,
+      typename = typename std::enable_if<std::is_scalar<T>::value>::type>
+  Tensor(const T& value, BaseContext* context)
+      : impl_(c10::make_intrusive<TensorImpl, UndefinedTensorImpl>(
+            value,
+            context)) {}
+
+```
+
+以下为Tensor借助TensorImpl实现一些操作的提现。
+
+```
+  inline int ndim() const {
+    return impl_.get()->ndim();
+  }
+
+  inline TIndex size() const {
+    return impl_.get()->size();
+  }
+
+  inline size_t itemsize() const {
+    return impl_.get()->itemsize();
+  }
+
+  inline size_t nbytes() const {
+    return impl_.get()->nbytes();
+  }
+
+  inline size_t capacity_nbytes() const {
+    return impl_.get()->capacity_nbytes();
+  }
+```
+
+# 参考文献
+
+* https://github.com/pytorch/pytorch
