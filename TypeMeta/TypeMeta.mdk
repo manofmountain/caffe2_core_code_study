@@ -1,0 +1,371 @@
+Title         : Caffe2核心代码解析系列之四：TypeMeta
+Author        : manofmountain
+Logo          : True
+
+[TITLE]
+
+# 介绍
+
+TypeMeta是描述Tensor或Blob等所抽象的数据类型的一种抽象。简言之，它主要用来表示某种类型如T的一些特征像这种类型在整个类型系统里面的Id，它的单个元素的大小ItemSize（类似于sizeof(T)，其实正是它的一种wrapper），还有就是此类型T的构造、拷贝及析构函数等。
+
+下面我们先去直接宏观上看TypeMeta的类表示，然后再分别去看它的某些细节实现像Id的实现等。
+
+
+# TypeMeta
+
+本来与TypeMeta相关的代码是放在Caffe2下面的这个地方的。当然现在这地方仍有这么两个文件存在的，不过它们只是个中转，再也不含有实际内容了。
+
+```
+caffe2]$ ls core/typeid
+typeid.h        typeid_test.cc
+```
+在Caffe2与Pytorch融合的大趋势下，TypeMeta相关的代码现在已经被放在了Aten的目录下面，中间更是实用了大量Aten中已有的内容，像Tensor的改变那样。
+
+```
+ATen]$ ls core/typeid.
+typeid.cpp  typeid.h
+```
+
+如下为TypeMeta的一个基本定义及简要注释说明。可以看出它主要提供一种类型T注册的Id，相关的Ctor/Copy/Destructor函数及表示基本元素大小的ItemSize等。
+
+```
+/**
+ * TypeMeta is a thin class that allows us to store the type of a container such
+ * as a blob, or the data type of a tensor, with a unique run-time id. It also
+ * stores some additional data such as the item size and the name of the type
+ * for run-time inspection.
+ */
+class AT_CORE_API TypeMeta {
+ public:
+  using PlacementNew = void(void*, size_t);
+  using TypedCopy = void(const void*, void*, size_t);
+  using TypedDestructor = void(void*, size_t);
+  /** Create a dummy TypeMeta object. To create a TypeMeta object for a specific
+   * type, use TypeMeta::Make<T>().
+   */
+  TypeMeta() noexcept
+      : id_(TypeIdentifier::uninitialized()),
+        itemsize_(0),
+        ctor_(nullptr),
+        copy_(nullptr),
+        dtor_(nullptr) {}
+```
+
+我们在定义一个类型T的TypeMeta对象时需要使用Make<T>函数来实现，而非直接调用其构造函数，这亦是为了保证每个类型T拥有的TypeMeta对象的唯一性。
+
+```
+ private:
+  // TypeMeta can only be created by Make, making sure that we do not
+  // create incorrectly mixed up TypeMeta objects.
+  TypeMeta(
+      TypeIdentifier i,
+      size_t s,
+      PlacementNew* ctor,
+      TypedCopy* copy,
+      TypedDestructor* dtor) noexcept
+      : id_(i), itemsize_(s), ctor_(ctor), copy_(copy), dtor_(dtor) {}
+```
+除了上面说的，还提供了此类型T所具有的name，可借RTTI等功能使用。比较有意思的是一些static template member functions的使用。使得此类可提供许多基本的静态特定类型功能函数。当然这些函数里都不会用到类非静态成员。
+```
+ /**
+   * Returns the unique id for the given type T. The id is unique for the type T
+   * in the sense that for any two different types, their id are different; for
+   * the same type T, the id remains the same over different calls of the
+   * function. However, this is not guaranteed over different runs, as the id
+   * is generated during run-time. Do NOT serialize the id for storage.
+   */
+  template <typename T>
+  AT_CORE_API static TypeIdentifier Id();
+
+  /**
+   * Returns the item size of the type. This is equivalent to sizeof(T).
+   */
+  template <typename T>
+  static size_t ItemSize() {
+    return sizeof(T);
+  }
+
+  /**
+   * Returns the registered printable name of the type.
+   *
+   * Works for only the ones registered with CAFFE_KNOWN_TYPE
+   */
+  template <typename T>
+  static const char* TypeName() {
+    auto it = gTypeNames().find(Id<T>());
+    assert(it != gTypeNames().end());
+    return it->second.c_str();
+  }
+
+  /**
+   * Placement new function for the type.
+   */
+  template <typename T>
+  static void _Ctor(void* ptr, size_t n) {
+    T* typed_ptr = static_cast<T*>(ptr);
+    for (size_t i = 0; i < n; ++i) {
+      new (typed_ptr + i) T;
+    }
+  }
+
+  template <typename T>
+  static void _CtorNotDefault(void* /*ptr*/, size_t /*n*/) {
+    _ThrowRuntimeTypeLogicError(
+        "Type " + std::string(at::demangle_type<T>()) +
+        " is not default-constructible.");
+  }
+```
+以下为TypeMeta的一些私有成员变量。在上面的介绍中已经知道其意了。
+
+```
+
+ private:
+  TypeIdentifier id_;
+  size_t itemsize_;
+  PlacementNew* ctor_;
+  TypedCopy* copy_;
+  TypedDestructor* dtor_;
+};
+```
+
+以下两个则可用来去判断两个Tensor或Blob是否具有相同的存储元素类型（需知C++是门强类型语言啊！）
+
+```
+inline bool operator==(const TypeMeta& lhs, const TypeMeta& rhs) noexcept {
+  return (lhs.id_ == rhs.id_);
+}
+inline bool operator!=(const TypeMeta& lhs, const TypeMeta& rhs) noexcept {
+  return !operator==(lhs, rhs);
+}
+```
+
+在Caffe2中，我们可直接使用CAFFE_KNOW_TYPE(T)这个宏语句来注册我们自己的类型T，这是一种类型安全的做法。下面则是此种宏的实现。
+
+```
+#ifdef _MSC_VER
+#define CAFFE_KNOWN_TYPE(T)                                               \
+  template <>                                                             \
+  AT_CORE_EXPORT TypeIdentifier TypeMeta::Id<T>() {                       \
+    static const TypeIdentifier type_id = TypeIdentifier::createTypeId(); \
+    static TypeNameRegisterer<T> registerer(type_id, #T);                 \
+    return type_id;                                                       \
+  }
+#else // _MSC_VER
+#define CAFFE_KNOWN_TYPE(T)                                               \
+  template <>                                                             \
+  TypeIdentifier TypeMeta::Id<T>() {                                      \
+    static const TypeIdentifier type_id = TypeIdentifier::createTypeId(); \
+    static TypeNameRegisterer<T> registerer(type_id, #T);                 \
+    return type_id;                                                       \
+  }
+#endif
+```
+
+下面则是一种直接将某些类型设为Preallocated id的做法。当然这里的一些类型都是需要使用的已经知道的基本类型。
+
+```
+
+/**
+ * CAFFE_DECLARE_KNOWN_TYPE and CAFFE_DEFINE_KNOWN_TYPE are used
+ * to preallocate ids for types that are queried very often so that they
+ * can be resolved at compile time. Please use CAFFE_KNOWN_TYPE() instead
+ * for your own types to allocate dynamic ids for them.
+ */
+#ifdef _MSC_VER
+#define CAFFE_DECLARE_KNOWN_TYPE(PreallocatedId, T)       \
+  template <>                                             \
+  inline AT_CORE_API TypeIdentifier TypeMeta::Id<T>() {   \
+    return TypeIdentifier(PreallocatedId);                \
+  }
+#else // _MSC_VER
+#define CAFFE_DECLARE_KNOWN_TYPE(PreallocatedId, T) \
+  template <>                                       \
+  inline TypeIdentifier TypeMeta::Id<T>() {         \
+    return TypeIdentifier(PreallocatedId);          \
+  }
+#endif
+```
+以下这个list显然会随着pytorch的发展而逐渐迭进发展。
+```
+struct _CaffeHighestPreallocatedTypeId final {};
+
+CAFFE_DECLARE_KNOWN_TYPE(0, uint8_t)
+CAFFE_DECLARE_KNOWN_TYPE(1, int8_t)
+CAFFE_DECLARE_KNOWN_TYPE(2, int16_t)
+CAFFE_DECLARE_KNOWN_TYPE(3, int)
+CAFFE_DECLARE_KNOWN_TYPE(4, int64_t)
+CAFFE_DECLARE_KNOWN_TYPE(5, at::Half)
+CAFFE_DECLARE_KNOWN_TYPE(6, float)
+CAFFE_DECLARE_KNOWN_TYPE(7, double)
+CAFFE_DECLARE_KNOWN_TYPE(8, at::ComplexHalf)
+CAFFE_DECLARE_KNOWN_TYPE(9, std::complex<float>)
+CAFFE_DECLARE_KNOWN_TYPE(10, std::complex<double>)
+// 10 = undefined type id
+
+CAFFE_DECLARE_KNOWN_TYPE(12, Tensor)
+CAFFE_DECLARE_KNOWN_TYPE(13, std::string)
+CAFFE_DECLARE_KNOWN_TYPE(14, bool)
+CAFFE_DECLARE_KNOWN_TYPE(15, uint16_t)
+CAFFE_DECLARE_KNOWN_TYPE(16, char)
+CAFFE_DECLARE_KNOWN_TYPE(17, std::unique_ptr<std::mutex>)
+CAFFE_DECLARE_KNOWN_TYPE(18, std::unique_ptr<std::atomic<bool>>)
+CAFFE_DECLARE_KNOWN_TYPE(19, std::vector<int32_t>)
+CAFFE_DECLARE_KNOWN_TYPE(20, std::vector<int64_t>)
+CAFFE_DECLARE_KNOWN_TYPE(21, std::vector<unsigned long>)
+CAFFE_DECLARE_KNOWN_TYPE(22, bool*)
+CAFFE_DECLARE_KNOWN_TYPE(23, char*)
+CAFFE_DECLARE_KNOWN_TYPE(24, int*)
+
+#ifdef CAFFE2_UNIQUE_LONG_TYPEMETA
+CAFFE_DECLARE_KNOWN_TYPE(25, long)
+CAFFE_DECLARE_KNOWN_TYPE(26, std::vector<long>)
+#endif // CAFFE2_UNIQUE_LONG_TYPEMETA
+
+CAFFE_DECLARE_KNOWN_TYPE(27, _CaffeHighestPreallocatedTypeId)
+```
+
+# TypeIdentifier
+
+在介绍TypeMeta提供的类型T的基本功能时像ItemSize/Ctor/Dtor/Copy/name等都比较易理解，只有表示说明T的具体类型时，为了保证其唯一性，作者使用了TypeIdentifier来对其做了wrapper，进而提供保证使类型T唯一的equility与hash函数。
+
+下面为TypeIdentifier的一些介绍。Caffe2与Pytorch后端融合后，TypeIdentifier变为了Aten类型IdWrapper的一个子类，显然在这里是为了保证不在一个框架下出现重复的代码。TypeIdentifier只定义了一个operator<函数，为了使得它能被用于map/set中的元素里面。而IdWrapper里面则提供了些功能使得它可以被用在unordered_map/un_ordered_set里面。
+
+```
+/**
+ * A type id is a unique id for a given C++ type.
+ * You need to register your types using CAFFE_KNOWN_TYPE(MyType) to be able to
+ * use TypeIdentifier with custom types. This is for example used to store the
+ * dtype of tensors.
+ */
+class AT_CORE_API TypeIdentifier final : public at::IdWrapper<TypeIdentifier, uint16_t> {
+ public:
+  static TypeIdentifier createTypeId();
+
+  friend std::ostream& operator<<(
+      std::ostream& stream,
+      TypeIdentifier typeId);
+  friend bool operator<(TypeIdentifier lhs, TypeIdentifier rhs);
+
+  // This is 8, because 0 is uint8_t (due to ScalarType BC constraint)
+  static constexpr TypeIdentifier uninitialized() {
+    return TypeIdentifier(8);
+  }
+
+ private:
+  constexpr explicit TypeIdentifier(uint16_t id) : IdWrapper(id) {}
+  friend class TypeMeta;
+};
+
+// Allow usage in std::map / std::set
+// TODO Disallow this and rather use std::unordered_map/set everywhere
+inline bool operator<(TypeIdentifier lhs, TypeIdentifier rhs) {
+  return lhs.underlyingId() < rhs.underlyingId();
+}
+```
+以下两句保证了它可被用于unordered_map/unordered_set当中。
+```
+namespace at {
+using DataType = caffe2::TypeIdentifier;
+}
+
+AT_DEFINE_HASH_FOR_IDWRAPPER(caffe2::TypeIdentifier)
+```
+使用TypeIdentifier成员函数来生成唯一的IdentifierId。
+
+```
+TypeIdentifier TypeIdentifier::createTypeId() {
+  static std::atomic<TypeIdentifier::underlying_type> counter(
+      TypeMeta::Id<_CaffeHighestPreallocatedTypeId>().underlyingId());
+  const TypeIdentifier::underlying_type new_value = ++counter;
+  if (new_value ==
+      std::numeric_limits<TypeIdentifier::underlying_type>::max()) {
+    throw std::logic_error(
+        "Ran out of available type ids. If you need more than 2^16 CAFFE_KNOWN_TYPEs, we need to increase TypeIdentifier to use more than 16 bit.");
+  }
+  return TypeIdentifier(new_value);
+}
+```
+
+# IdWrapper
+
+IdWrapper是Aten中一个对象，用于实现不同类型T的唯一表示（一种C++的强类型安全保证）。它是一种类型T的wrapper,提供了其唯一的Id。
+
+```
+/**
+ * This template simplifies generation of simple classes that wrap an id
+ * in a typesafe way. Namely, you can use it to create a very lightweight
+ * type that only offers equality comparators and hashing. Example:
+ *
+ *   struct MyIdType final : IdWrapper<MyIdType, uint32_t> {
+ *     constexpr explicit MyIdType(uint32_t id): IdWrapper(id) {}
+ *   };
+ *
+ * Then in the global top level namespace:
+ *
+ *   AT_DEFINE_HASH_FOR_IDWRAPPER(MyIdType);
+ *
+ * That's it - equality operators and hash functions are automatically defined
+ * for you, given the underlying type supports it.
+ */
+template <class ConcreteType, class UnderlyingType>
+class AT_CORE_API IdWrapper {
+ public:
+  using underlying_type = UnderlyingType;
+  using concrete_type = ConcreteType;
+
+ protected:
+  constexpr explicit IdWrapper(underlying_type id) noexcept(
+      noexcept(underlying_type(std::declval<underlying_type>())))
+      : id_(id) {}
+
+  constexpr underlying_type underlyingId() const
+      noexcept(noexcept(underlying_type(std::declval<underlying_type>()))) {
+    return id_;
+  }
+
+```
+
+以下为保证类型T可用于unordered_map的函数实现。从此我们亦可知道若要使某一类的对象可用于unordered_map当中，那么我们就需要提供比较其equity及计算其Hash值的两个函数。
+
+```
+private:
+  friend size_t hash_value(const concrete_type& v) {
+    return std::hash<underlying_type>()(v.id_);
+  }
+
+  // TODO Making operator== noexcept if underlying type is noexcept equality
+  // comparable doesn't work with GCC 4.8.
+  //      Fix this once we don't need GCC 4.8 anymore.
+  friend constexpr bool operator==(
+      const concrete_type& lhs,
+      const concrete_type& rhs) {
+    return lhs.id_ == rhs.id_;
+  }
+
+  // TODO Making operator!= noexcept if operator== is noexcept doesn't work with
+  // GCC 4.8.
+  //      Fix this once we don't need GCC 4.8 anymore.
+  friend constexpr bool operator!=(
+      const concrete_type& lhs,
+      const concrete_type& rhs) {
+    return !(lhs == rhs);
+  }
+```
+
+最后是Aten中使用的一个utility宏。它是一个template specialization，用于返回我们定义的class类型的Id值的hash value。
+
+```
+#define AT_DEFINE_HASH_FOR_IDWRAPPER(ClassName) \
+  namespace std {                               \
+  template <>                                   \
+  struct hash<ClassName> {                      \
+    size_t operator()(ClassName x) const {      \
+      return hash_value(x);                     \
+    }                                           \
+  };                                            \
+  }
+```
+
+# 参考文献
+
+* https://github.com/pytorch/pytorch
