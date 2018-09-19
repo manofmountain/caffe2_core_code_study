@@ -1,0 +1,273 @@
+Title         : Caffe2核心代码解析系列之五：Blob
+Author        : manofmountain
+Logo          : True
+
+[TITLE]
+
+# 介绍
+
+Caffe2中Blob的概念应该来自于Caffe。它是有类型的内存抽象，主要包含两个成员，一为指向存储元素的指针，另一则为此元素的类型(TypeMeta)。这么说来它其实与Tensor好像，本质上它有些赘余，更像是来自Caffe的一种包袱。在笔者已知的框架设计里像Tensorflow/Pytorch/Mxnet等无不是只提供Tensor这么一种有类型的内存抽象。亦可以看出它没有像Tensor那样有dimms的成员。
+
+Anyway，这样我们在使用Caffe Operator时，会以Blob作为输入、输出（与Caffe一样），只是在Operator内部，一般需要使用Blob的data方法得到指向其元素的指针，然后再将它强制类型转换为合适的类型T（一般为Tensor），再使用它进行各种具体运算。
+
+Caffe2中与Blob相关的代码如下。本节当中我们将重点介绍其中所涉及的Blob/BlobSerializaer/BlobStats等类及相关功能函数。
+
+```
+core]$ ls blob
+blob_gpu_test.cc           blob_serialization_gpu.cc  blob_stats.cc
+blob.h                     blob_serialization.h       blob_stats.h
+blob_serialization.cc      blob_serializer_base.h     blob_test.cc
+```
+
+# Blob
+
+以下为Blob的基本描述，可见看出它只有两个成员meta_与pointer_，分别表示指向存储对象的指针以及此指针的类型。
+
+```
+/**
+ * @brief Blob is a general container that hosts a typed pointer.
+ *
+ * A Blob hosts a pointer as well as its type, and takes charge of deleting it
+ * properly when the blob is deallocated or re-allocated with a new type. A blob
+ * could contain anything, although the most common case is to contain a Tensor.
+ */
+class CAFFE2_API Blob final {
+ public:
+  using DestroyCall = void(void*);
+
+  /**
+   * Initializes an empty Blob.
+   */
+  Blob() : meta_(), pointer_(nullptr) {}
+  ~Blob() { Reset(); }
+
+  Blob(Blob&& other) noexcept
+      : meta_(std::move(other.meta_)),
+        pointer_(std::move(other.pointer_)),
+        destroy_(std::move(other.destroy_)) {
+    other.meta_ = {};
+    other.pointer_ = nullptr;
+    other.destroy_ = nullptr;
+  }
+  ........
+  ........
+};
+```
+
+通过下面两个成员函数，我们可以检查Blob所包含的对象的类型及是否是某种Device tensor类型等。
+
+```
+  /**
+   * Checks if the content stored in the blob is of type T.
+   */
+  template <class T>
+  bool IsType() const {
+    return meta_.Match<T>();
+  }
+
+  bool IsTensorType(DeviceType device_type) const {
+    bool is_match = meta_.Match<Tensor>();
+    auto* tensor = static_cast<Tensor*>(pointer_);
+    if (is_match && tensor && tensor->GetDeviceType() == device_type) {
+      return true;
+    }
+    return false;
+  }
+```
+
+以下为两种得到有类型指针与裸对象指针的办法。
+
+```
+  /**
+   * @brief Gets the const reference of the stored object. The code checks if
+   * the stored object is of the desired type.
+   */
+  // TODO(jerryzh): add a Get(DeviceType) function?
+  template <class T>
+  const T& Get() const {
+    CAFFE_ENFORCE(
+        IsType<T>(),
+        "wrong type for the Blob instance. Blob contains ",
+        meta_.name(),
+        " while caller expects ",
+        TypeMeta::TypeName<T>());
+    // TODO: after we add Get<Tensor>(DeviceType)
+    // and changed all the callsites, we can add
+    // a static assert here to enforce T != Tensor
+    return *static_cast<const T*>(pointer_);
+  }
+
+  const void* GetRaw() const {
+    return pointer_;
+  }
+```
+
+若想要对其存储对象进行写操作，则需要调用mutable_data方法，如下所示。
+
+```
+  /**
+   * @brief Gets a mutable pointer to the stored object.
+   *
+   * If the current object is not of the right type, a new object is created
+   * and the old object is freed. Note that type T should have a default
+   * constructor. Otherwise, create the object yourself first, and use
+   * Reset().
+   */
+  template <class T>
+  T* GetMutable() {
+    static_assert(
+        std::is_default_constructible<T>::value,
+        "GetMutable can't be called with non-default-constructible types. "
+        "Try using specialized methods");
+    static_assert(
+        !std::is_same<T, Tensor>::value,
+        "Use GetMutableTensor(DeviceType) instead");
+    if (IsType<T>()) {
+      return static_cast<T*>(pointer_);
+    } else {
+      VLOG(1) << "Create new mutable object " << TypeMeta::TypeName<T>();
+      return Reset<T>(new T());
+    }
+  }
+
+  inline Tensor* GetMutableTensor(DeviceType device_type) {
+    if (IsTensorType(device_type)) {
+      return static_cast<Tensor*>(pointer_);
+    } else {
+      VLOG(1) << "Create new mutable object " << TypeMeta::TypeName<Tensor>()
+              << " DeviceType:" << device_type;
+      return Reset<Tensor>(new Tensor(device_type));
+    }
+  }
+```
+Reset 成员函数将使Blob得到此传入对象的ownership。在此前总要先释放指之前拥有的对象的ownership。
+```
+  /**
+   * Sets the underlying object to the allocated one. The Blob then takes over
+   * the ownership of the passed in pointer. If there is already an object in
+   * the Blob, the old object is freed.
+   *
+   * This is used when the underlying class T does not have a default ctor, or
+   * complex initializations needs to be done outside the blob.
+   */
+  template <class T>
+  T* Reset(T* allocated) {
+    if (pointer_ && destroy_) {
+      destroy_(pointer_);
+    }
+    meta_ = TypeMeta::Make<T>();
+    pointer_ = static_cast<void*>(allocated);
+    destroy_ = &Destroy<T>;
+    return allocated;
+  }
+
+  inline void*
+  Reset(void* allocated, const TypeMeta& meta, DestroyCall* destroy) {
+    if (pointer_ && destroy_) {
+      destroy_(pointer_);
+    }
+    meta_ = meta;
+    pointer_ = static_cast<void*>(allocated);
+    destroy_ = destroy;
+    return allocated;
+  }
+
+  /**
+   * Resets the Blob to an empty one.
+   */
+  inline void Reset() {
+    if (pointer_ && destroy_) {
+      destroy_(pointer_);
+    }
+    pointer_ = nullptr;
+    meta_ = TypeMeta();
+    destroy_ = nullptr;
+  }
+
+```
+ShareExternal与Reset相反，它只享用此传入对象，但并不负责释放它即并不需对它付责任。
+
+```
+  /**
+   * Sets the underlying object to the allocated one, but does not take over
+   * the ownership of the passed in pointer. If there is already an object in
+   * the Blob, the old object is freed.
+   *
+   * Unlike Reset, this does not take over the ownership of the pointer and the
+   * caller is responsible for making sure that the lifetime of the allocated
+   * blob outlasts the lifetime of any access to this blob, until another Reset
+   * call is made or the blob is destructed.
+   */
+  template <class T>
+  typename std::remove_const<T>::type* ShareExternal(
+      typename std::remove_const<T>::type* allocated) {
+    return static_cast<T*>(ShareExternal(
+        static_cast<void*>(allocated),
+        TypeMeta::Make<typename std::remove_const<T>::type>()));
+  }
+
+  void* ShareExternal(void* allocated, const TypeMeta& meta) {
+    if (pointer_ && destroy_) {
+      destroy_(pointer_);
+    }
+    meta_ = meta;
+    pointer_ = static_cast<void*>(allocated);
+    destroy_ = nullptr;
+    return allocated;
+  }
+```
+
+Blob承担了部分Serialize的功能，可见所有的Weights需要放入到Blob里面正是需要仰仗它的这一功能来进行checkpoints存取。
+
+```
+  /**
+   * Serializes the current blob, if possible. Note that this serialization uses
+   * the registration mechanism and one has to implement specific serialization
+   * approaches for specific classes. Acceptor should take care of writing data
+   * to the actual storage.
+   */
+  void Serialize(
+      const string& name,
+      BlobSerializerBase::SerializationAcceptor acceptor,
+      int chunk_size = kDefaultChunkSize) const;
+
+  /**
+   * @brief Convenience function to serialize a blob to a string.
+   *
+   * This is a conveinence function to serialize small Blobs that produce
+   * manageable serialized strings. To serialize big blobs such as
+   * large sparse tensors, use the fully-functional interface in
+   * blob_serializer_base.h.
+   *
+   * NOTE: this function doesn't do chunking and might break with big tensors.
+   */
+  string Serialize(const string& name) const;
+
+  /**
+   * Deserializes from a string containing either BlobProto or TensorProto. If
+   * the deserialization fails, the content in the blob should no longer be
+   * trusted.
+   */
+  void Deserialize(const string& content);
+  void Deserialize(const BlobProto& proto);
+
+```
+
+最后则为Blob私有空间的一些成员与公共函数。Destroy是一个static 模板成员函数，用在这里是再合适不过了。
+
+```
+ private:
+  /**
+   * @brief A destroy call that is used to properly deconstruct objects.
+   */
+  template <class T>
+  static void Destroy(void* pointer) {
+    delete static_cast<T*>(pointer);
+  }
+  TypeMeta meta_;
+  void* pointer_ = nullptr;
+  DestroyCall* destroy_ = nullptr;
+
+  AT_DISABLE_COPY_AND_ASSIGN(Blob);
+};
+```
