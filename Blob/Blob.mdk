@@ -6,7 +6,7 @@ Logo          : True
 
 # 介绍
 
-Caffe2中Blob的概念应该来自于Caffe。它是有类型的内存抽象，主要包含两个成员，一为指向存储元素的指针，另一则为此元素的类型(TypeMeta)。这么说来它其实与Tensor好像，本质上它有些赘余，更像是来自Caffe的一种包袱。在笔者已知的框架设计里像Tensorflow/Pytorch/Mxnet等无不是只提供Tensor这么一种有类型的内存抽象。亦可以看出它没有像Tensor那样有dimms的成员。
+Caffe2中Blob的概念应该来自于Caffe。它是有类型的内存抽象，主要包含两个成员，一为指向存储元素的指针，另一则为此元素的类型(TypeMeta)。这么说来它其实与Tensor好像，本质上它有些赘余，更像是来自Caffe的一种包袱。在笔者已知的框架设计里像Tensorflow/Pytorch/Mxnet等无不是只提供Tensor这么一种有类型的内存抽象。不过在Caffe2中，框架设计者可能是不想它太多余，于是将Serialization（从而将weights存成string）的功能给了它。
 
 Anyway，这样我们在使用Caffe Operator时，会以Blob作为输入、输出（与Caffe一样），只是在Operator内部，一般需要使用Blob的data方法得到指向其元素的指针，然后再将它强制类型转换为合适的类型T（一般为Tensor），再使用它进行各种具体运算。
 
@@ -271,3 +271,172 @@ Blob承担了部分Serialize的功能，可见所有的Weights需要放入到Blo
   AT_DISABLE_COPY_AND_ASSIGN(Blob);
 };
 ```
+
+# BlobSerializerBase和BlobDeserializerBase
+
+下面为BlobSerializerBase的概况，它是一个实现Blob serialization功能的虚基类。不同类型的Blob需要分别继承它来实现自己的Serialization操作。
+
+```
+/**
+ * @brief BlobSerializerBase is an abstract class that serializes a blob to a
+ * string.
+ *
+ * This class exists purely for the purpose of registering type-specific
+ * serialization code. If you need to serialize a specific type, you should
+ * write your own Serializer class, and then register it using
+ * REGISTER_BLOB_SERIALIZER. For a detailed example, see TensorSerializer for
+ * details.
+ */
+class BlobSerializerBase {
+ public:
+  virtual ~BlobSerializerBase() {}
+  using SerializationAcceptor =
+     std::function<void(const std::string& blobName, const std::string& data)>;
+```
+
+下面为它的两个主要的Serialization功能函数。
+
+```
+   * @brief The virtual function that returns a serialized string for the input
+   * blob.
+   * @param blob
+   *     the input blob to be serialized.
+   * @param name
+   *     the blob name to be used in the serialization implementation. It is up
+   *     to the implementation whether this name field is going to be used or
+   *     not.
+   * @param acceptor
+   *     a lambda which accepts key value pairs to save them to storage.
+   *     serailizer can use it to save blob in several chunks
+   *     acceptor should be thread-safe
+   */
+  virtual void Serialize(const Blob& blob, const std::string& name,
+                        SerializationAcceptor acceptor) = 0;
+
+  virtual void SerializeWithChunkSize(
+      const Blob& blob,
+      const std::string& name,
+      SerializationAcceptor acceptor,
+      int /*chunk_size*/) {
+    // Base implementation.
+    Serialize(blob, name, acceptor);
+  }
+};
+```
+
+我们需要对每个类型Blob生成其特定的BlobSerializer子类。
+
+```
+// The Blob serialization registry and serializer creator functions.
+CAFFE_DECLARE_TYPED_REGISTRY(
+    BlobSerializerRegistry,
+    TypeIdentifier,
+    BlobSerializerBase,
+    std::unique_ptr);
+#define REGISTER_BLOB_SERIALIZER(id, ...) \
+  CAFFE_REGISTER_TYPED_CLASS(BlobSerializerRegistry, id, __VA_ARGS__)
+// Creates an operator with the given operator definition.
+inline unique_ptr<BlobSerializerBase> CreateSerializer(TypeIdentifier id) {
+  return BlobSerializerRegistry()->Create(id);
+}
+```
+
+相对应的有个Deserializer虚基类提供了Deserialization需要的函数接口。
+
+```
+/**
+ * @brief BlobDeserializerBase is an abstract class that deserializes a blob
+ * from a BlobProto or a TensorProto.
+ */
+class CAFFE2_API BlobDeserializerBase {
+ public:
+  virtual ~BlobDeserializerBase() {}
+
+  // Deserializes from a BlobProto object.
+  virtual void Deserialize(const BlobProto& proto, Blob* blob) = 0;
+};
+
+CAFFE_DECLARE_REGISTRY(BlobDeserializerRegistry, BlobDeserializerBase);
+#define REGISTER_BLOB_DESERIALIZER(name, ...) \
+  CAFFE_REGISTER_CLASS(BlobDeserializerRegistry, name, __VA_ARGS__)
+// Creates an operator with the given operator definition.
+inline unique_ptr<BlobDeserializerBase> CreateDeserializer(const string& type) {
+  return BlobDeserializerRegistry()->Create(type);
+}
+```
+
+# TensorSerializer和TensorDeserializer
+
+TensorSerializer为BlobSerializerBase的一个子类，顾名思义，它主要用来实现Tensor类型的Serialization操作。同样还有一个为TensorDeserializer，它是BlobDeserializerBase的子类。
+
+下面为在进行Serialization时的细节实现。可见主要是将需要的类型数据存到Protocol buffer里面，然后再使用它的功能来进行serialization/deserialization。
+
+```
+namespace detail {
+template <typename SrcType, typename DstType>
+inline void CopyToProtoAsIs(
+    const size_t size,
+    const SrcType* src,
+    google::protobuf::RepeatedField<DstType>* field,
+    BaseContext* context) {
+  static_assert(
+      sizeof(SrcType) == sizeof(DstType),
+      "The source type and dest type cannot be copied as-is. Did "
+      "you mean CopyToProtoWithCast?");
+  field->Reserve(size);
+  for (int i = 0; i < size; ++i) {
+    field->Add(0);
+  }
+  context->template CopyToCPU<SrcType>(
+      size, src, reinterpret_cast<SrcType*>(field->mutable_data()));
+  // Make sure that we finish the copy into the protobuf.
+  context->FinishDeviceComputation();
+}
+
+template <typename SrcType, typename DstType>
+inline void CopyToProtoWithCast(
+    const size_t size,
+    const SrcType* src,
+    google::protobuf::RepeatedField<DstType>* field,
+    BaseContext* context) {
+  // TODO: we are having one unnecessary copy here if the context is already
+  // CPUContext. Remove it if it is performance critical.
+  unique_ptr<SrcType[]> buffer(new SrcType[size]);
+  context->template CopyToCPU<SrcType>(size, src, buffer.get());
+  context->FinishDeviceComputation();
+  field->Reserve(size);
+  for (int i = 0; i < size; ++i) {
+    field->Add(static_cast<DstType>(buffer[i]));
+  }
+}
+```
+
+以下为Blob里面的两个Serialize函数实现，可以看出它主要是借助不同类型的BlobSerializer来完成此功能。Deserialize函数的实现与此类似，在此不再赘述。
+
+```
+// The blob serialization member function implementation.
+void Blob::Serialize(
+    const string& name,
+    BlobSerializerBase::SerializationAcceptor acceptor,
+    int chunk_size) const {
+  std::unique_ptr<BlobSerializerBase> serializer(CreateSerializer(meta_.id()));
+  CAFFE_ENFORCE(serializer, "No known serializer for ", meta_.name());
+  serializer->SerializeWithChunkSize(*this, name, acceptor, chunk_size);
+}
+
+// The blob serialization member function implementation.
+std::string Blob::Serialize(const string& name) const {
+  std::string data;
+  BlobSerializerBase::SerializationAcceptor acceptor = [&data](
+      const std::string&, const std::string& blob) {
+    DCHECK(data.empty()); // should be called once with kNoChunking
+    data = blob;
+  };
+  this->Serialize(name, acceptor, kNoChunking);
+  return data;
+}
+```
+
+# 参考文献
+
+* https://github.com/pytorch/pytorch
