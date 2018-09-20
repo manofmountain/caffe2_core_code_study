@@ -437,6 +437,72 @@ std::string Blob::Serialize(const string& name) const {
 }
 ```
 
+# BlobStatGetter
+
+Blob里面提供了些辅助类来提供些统计等功能如BlobStatGetter类。由下面代码可以看出，它亦是通过Type Id来选择使用不同的子类StatGetter的。
+
+```
+struct BlobStatGetter {
+  virtual size_t sizeBytes(const Blob& blob) const = 0;
+  virtual ~BlobStatGetter() {}
+};
+
+struct BlobStatRegistry {
+ private:
+  std::unordered_map<TypeIdentifier, std::unique_ptr<BlobStatGetter>> map_;
+  void doRegister(TypeIdentifier id, std::unique_ptr<BlobStatGetter>&& v);
+
+ public:
+  template <typename T, typename Getter>
+  struct Registrar {
+    Registrar() {
+      BlobStatRegistry::instance().doRegister(
+          TypeMeta::Id<T>(), std::unique_ptr<Getter>(new Getter));
+    }
+  };
+
+  const BlobStatGetter* get(TypeIdentifier id);
+  static BlobStatRegistry& instance();
+};
+```
+
+以下为具体的对其使用。
+
+```
+const BlobStatGetter* BlobStatRegistry::get(TypeIdentifier id) {
+  auto it = map_.find(id);
+  if (it == map_.end()) {
+    return nullptr;
+  }
+  return it->second.get();
+}
+
+BlobStatRegistry& BlobStatRegistry::instance() {
+  static BlobStatRegistry registry;
+  return registry;
+}
+
+void BlobStatRegistry::doRegister(
+    TypeIdentifier id,
+    std::unique_ptr<BlobStatGetter>&& v) {
+  // don't use CAFFE_ENFORCE_EQ to avoid static initialization order fiasco.
+  if (map_.count(id) > 0) {
+    throw std::runtime_error("BlobStatRegistry: Type already registered.");
+  }
+  map_[id] = std::move(v);
+}
+
+namespace BlobStat {
+
+size_t sizeBytes(const Blob& blob) {
+  auto* p = BlobStatRegistry::instance().get(blob.meta().id());
+  return p ? p->sizeBytes(blob) : 0;
+}
+
+} // namespace BlobStats
+
+```
+
 # 参考文献
 
 * https://github.com/pytorch/pytorch
